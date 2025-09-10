@@ -1,0 +1,133 @@
+    def _try_entry(self, candle: Candle, phase) -> None:
+        # Aktuellen E-Zustand holen (maßgeblich)
+        fsm_e  = self.machines[E]
+        phase_e = fsm_e.state.current_phase
+        ctx_e   = fsm_e.state
+
+        print(f"[DEBUG] TRY_ENTRY: active_tf={self.active_tf}, entered_direction={self.entered_direction}, "
+            f"phase_e={phase_e}, K={self.phases[K]}, B={self.phases[B]}, "
+            f"dirK={get_direction(self.phases[K]) if self.phases[K] else None}, "
+            f"dirB={get_direction(self.phases[B]) if self.phases[B] else None}")
+
+        # 1) Harte Gatekeeper
+        if self.active_tf != E:
+            print("[ORDER-SKIP] E nicht aktiv – kein Entry.")
+            return
+
+        k_phase = self.phases.get(K)
+        b_phase = self.phases.get(B)
+        if not k_phase or not b_phase:
+            print("[ORDER-SKIP] K/B Phase fehlt – kein Entry.")
+            return
+
+        dirK = get_direction(k_phase)
+        dirB = get_direction(b_phase)
+        if self.entered_direction is None or dirK != dirB or dirK != self.entered_direction:
+            print("[ORDER-SKIP] K/B Richtung misaligned oder entered_direction fehlt – kein Entry.")
+            return
+
+        if not can_b_to_e(k_phase, b_phase):
+            print("[ORDER-SKIP] can_b_to_e=False – kein Entry.")
+            return
+
+        if phase_e not in (Phase.BASE_SWITCH_BULL, Phase.BASE_SWITCH_BEAR):
+            print(f"[ORDER-SKIP] E nicht in BASE_SWITCH_* (phase_e={phase_e}) – kein Entry.")
+            return
+        
+        # --- Entry nur bis zur 4. Base in B (M30) ---
+        b_ctx = self.machines[B].state
+
+        # Kandidaten-Richtung direkt aus phase_e bestimmen
+        is_bull_candidate = (phase_e == Phase.BASE_SWITCH_BULL)
+        is_bear_candidate = (phase_e == Phase.BASE_SWITCH_BEAR)
+
+        if is_bull_candidate and getattr(b_ctx, 'bull_base_seq_B', 0) > 4:
+            print(f"[ORDER-SKIP] B bull_base_seq_B={b_ctx.bull_base_seq_B} > 4 – kein Long-Entry.")
+            return
+        if is_bear_candidate and getattr(b_ctx, 'bear_base_seq_B', 0) > 4:
+            print(f"[ORDER-SKIP] B bear_base_seq_B={b_ctx.bear_base_seq_B} > 4 – kein Short-Entry.")
+            return
+
+
+        # 2) Dedup je Symbol+Kerzenzeit (Phase weglassen!)
+        entry_key = (self.symbol, candle.timestamp)
+        if entry_key in self.processed_entry_candles:
+            print(f"[ORDER-SKIP] Entry für {entry_key} bereits verarbeitet.")
+            return
+        
+        
+        # 2.5) Lokaler Guard – verhindert Doppelplatzierung bei MT5-Latenz
+        if getattr(self, "open_ticket", None):
+            print("[ORDER-SKIP] Lokal bereits Pending/Position – skip.")
+            return
+
+
+
+        # 3) Offene Order/Position verhindern
+        mt5_api   = self.data.mt5
+        open_pos  = mt5_api.positions_get(symbol=self.symbol) or []
+        open_ord  = mt5_api.orders_get(symbol=self.symbol) or []
+        active    = any(getattr(p, "magic", None) == 234000 for p in open_pos) \
+                or any(getattr(o, "magic", None) == 234000 for o in open_ord)
+        if active:
+            print(f"[ORDER-SKIP] Bereits Order/Position für {self.symbol} offen.")
+            return
+
+        # 4) Marktdaten
+        symbol_info = mt5_api.symbol_info(self.symbol)
+        tick_data   = mt5_api.symbol_info_tick(self.symbol)
+        if not symbol_info or not tick_data:
+            print("[ORDER-SKIP] symbol_info oder tick_data fehlt")
+            return
+
+        tick_size  = getattr(symbol_info, 'point', None)
+        stop_level = getattr(symbol_info, 'trade_stops_level', 0)
+        if not tick_size or tick_size <= 0:
+            print("[ORDER-SKIP] Ungültiger Tick")
+            return
+
+        ask = getattr(tick_data, 'ask', None)
+        bid = getattr(tick_data, 'bid', None)
+        if ask is None or bid is None:
+            print("[ORDER-SKIP] Tickpreise fehlen")
+            return
+
+        # 5) Entry-Logik (stabil über eingefrorenen Anchor aus switch_data[E])
+        buf = self.data.histories[self.symbol][E]
+        entry = None
+
+        anchor = self.switch_data.get(E) or {}
+
+        if self.entered_direction == 'bull' and phase_e == Phase.BASE_SWITCH_BULL:
+            entry = self.entry_mgr.check_buy_stop(
+                candles=buf,
+                current_ask=ask,
+                stop_level=stop_level,
+                tick_size=tick_size,
+                phase=phase_e,
+                ctx=ctx_e,
+                anchor=anchor  # ⟵ NEU: eingefrorener Trigger (previous_extreme)
+            )
+        elif self.entered_direction == 'bear' and phase_e == Phase.BASE_SWITCH_BEAR:
+            entry = self.entry_mgr.check_sell_stop(
+                candles=buf,
+                current_bid=bid,
+                stop_level=stop_level,
+                tick_size=tick_size,
+                phase=phase_e,
+                ctx=ctx_e,
+                anchor=anchor  # ⟵ NEU
+            )
+
+
+
+        # 6) Platzieren (mit Rollback bei Fehler)
+        if entry:
+            self.processed_entry_candles.add(entry_key)
+            try:
+                self._open_new_trade(entry)
+            except Exception:
+                self.processed_entry_candles.discard(entry_key)
+                raise
+        else:
+            print("[ORDER-SKIP] Entry-Bedingungen nicht erfüllt (EntryLogicManager lieferte None).")
