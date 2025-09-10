@@ -1,0 +1,18 @@
+    def _freeze_switch_anchor(self, tf, new_phase, st):
+        anchor_ts = getattr(st, "last_candle_ts", None)
+        if new_phase in (Phase.BASE_SWITCH_BULL, Phase.SWITCH_BULL):
+            self.switch_data[tf] = {
+                "dir": "bull",
+                "phase": new_phase,
+                "initial_extreme":  st.switch_bull_initial_low,
+                "previous_extreme": st.switch_bull_prev_higher_high,
+                "anchor_ts": anchor_ts,
+            }
+        elif new_phase in (Phase.BASE_SWITCH_BEAR, Phase.SWITCH_BEAR):
+            self.switch_data[tf] = {
+                "dir": "bear",
+                "phase": new_phase,
+                "initial_extreme":  st.switch_bear_initial_high,
+                "previous_extreme": st.switch_bear_prev_lower_low,
+                "anchor_ts": anchor_ts,
+            }
