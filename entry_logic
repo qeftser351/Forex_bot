@@ -1,0 +1,303 @@
+from typing import List, Optional, Dict
+from core.types import Candle, Phase
+from core.phase_manager import PhaseStateMachine
+from config.phase import (
+    is_confirmation_bullish,
+    is_confirmation_bearish
+)
+from datetime import datetime, time
+import pytz
+import math
+from config.phase import EMA_FAST_PERIOD, EMA_SLOW_PERIOD
+import pandas as pd
+from config.phase import ensure_list_of_candles
+from core.phase_state import PhaseState
+
+# Fallback für Mindestabstand, falls Broker keine trade_stops_level liefert
+default_stop_level_points = 10
+
+
+class ConfigEntryLogic:
+    def __init__(self, phase_machine: PhaseStateMachine, spread: float):
+        self.pm = phase_machine
+        self.spread = spread
+        self.default_stop_level_points = default_stop_level_points
+
+    def _min_dist(self, stop_level: float, tick_size: float) -> float:
+        """
+        Berechnet den minimalen Preisabstand (in Preis, nicht in Pips!) für Stop-Orders.
+        Gibt mindestens die Tickgröße zurück, selbst wenn stop_level=0.
+        """
+        level = stop_level if stop_level and stop_level > 0 else self.default_stop_level_points
+        return max(level * tick_size, tick_size)
+
+    #Einstigeszeiten definieren
+    def _is_within_allowed_time(self) -> bool:
+        berlin = pytz.timezone('Europe/Berlin')
+        now = datetime.now(berlin).timetz()
+        allowed = [
+            (time(7, 00), time(11, 0)),
+            (time(12, 55), time(14, 0)),
+            (time(14, 35), time(17, 0)),
+            (time(18, 45), time(22, 0)),
+        ]
+        return any(start <= now <= end for start, end in allowed)
+    
+    
+    
+    def check_buy_stop(
+        self,
+        candles,
+        current_ask,
+        stop_level,
+        tick_size,
+        phase: Optional[Phase] = None,
+        ctx: Optional[PhaseState] = None,
+        **kwargs
+    ):
+        if not self._is_within_allowed_time():
+            print("[INFO] Buy-Stop übersprungen – außerhalb des Zeitfensters.")
+            return None
+
+        if phase != Phase.BASE_SWITCH_BULL:
+            print(f"[SKIP] Buy-Stop: Phase ist {phase}, erwartet BASE_SWITCH_BULL")
+            return None
+
+        if ctx is None:
+            print("[SKIP] Buy-Stop: ctx fehlt")
+            return None
+
+        candles = ensure_list_of_candles(candles)
+        if len(candles) < 2:
+            return None
+
+        # --- NEU: Anchor einlesen (eingefrorener Switch-Anker aus E) ---
+        anchor = kwargs.get("anchor") or {}
+        use_anchor = (
+            isinstance(anchor, dict)
+            and anchor.get("dir") == "bull"
+            and (anchor.get("previous_extreme") is not None)
+            # Phase optional prüfen, falls mitgegeben:
+            and (anchor.get("phase") in (Phase.BASE_SWITCH_BULL, Phase.SWITCH_BULL, None))
+        )
+
+        # 1) gültige Confirmation
+        cctx = ctx.last_confirmation_bullish
+        confirm = cctx.candle if (cctx and cctx.valid) else None
+        if not confirm:
+            print(f"[SKIP] Buy-Stop: Keine gültige Confirmation-Bullish vorhanden (valid={getattr(cctx,'valid',None)})")
+            return None
+
+        # 2) Cluster-Fenster
+        cluster_ts = ctx.bull_cluster_enter_ts or ctx.phase_enter_ts
+        if cluster_ts and getattr(confirm, "timestamp", None) and confirm.timestamp < cluster_ts:
+            print(f"[SKIP] Buy-Stop: Confirmation vor Cluster-Eintritt (conf_ts={confirm.timestamp}, cluster_ts={cluster_ts})")
+            return None
+
+        # 3) Confirm muss nicht zwingend im aktuellen Buffer liegen, WENN Anchor genutzt wird
+        if not use_anchor:
+            conf_idx = next((i for i, c in enumerate(candles)
+                         if hasattr(confirm, 'timestamp') and c.timestamp == confirm.timestamp), None)
+            if conf_idx is None:
+                print(f"[SKIP] Buy-Stop: Confirm-Candle nicht im aktuellen Buffer (TS={getattr(confirm,'timestamp',None)})")
+                return None
+            if cluster_ts:
+                start_idx = next((i for i, c in enumerate(candles)
+                              if getattr(c, 'timestamp', None) and c.timestamp >= cluster_ts), 0)
+                if conf_idx < start_idx:
+                    print(f"[SKIP] Buy-Stop: Confirm-Candle liegt vor Fenster (conf_idx={conf_idx}, start_idx={start_idx})")
+                    return None
+
+        # 4) Switch-Kontext (nur verlangen, wenn KEIN Anchor übergeben wurde)
+        if not use_anchor:
+            prev_higher = ctx.switch_bull_prev_higher_high
+            initial_low = ctx.switch_bull_initial_low
+            if prev_higher is None or initial_low is None:
+                print(f"[SKIP] Buy-Stop: switch_bull_prev_higher_high={prev_higher}, switch_bull_initial_low={initial_low}")
+                return None
+
+        # === Preis-/SL-Logik ===
+        prev = candles[-2]
+        min_dist = max(self._min_dist(stop_level, tick_size), tick_size)
+
+        # --- NEU: Trigger aus Anchor (friert den Einstieg ein); sonst alte Logik ---
+        if use_anchor:
+            trigger = float(anchor["previous_extreme"])
+            desired_entry = trigger + tick_size  # 1 Tick über dem Anker-High
+            print(f"[ANCHOR] Buy-Stop: using frozen trigger @ {trigger} -> desired_entry={desired_entry}")
+        else:
+            desired_entry = prev.high + self.spread
+
+        if desired_entry - current_ask < min_dist:
+            entry_price = current_ask + min_dist + tick_size
+        else:
+            entry_price = desired_entry
+
+        curr = candles[-1]
+        ema_fast = getattr(curr, "ema10", None)
+        ema_slow = getattr(curr, "ema20", None)
+        if ema_fast is None or ema_slow is None:
+            print("[SKIP] Buy-Stop: EMA10 oder EMA20 fehlt")
+            return None
+
+        # SL weiterhin EMA-basiert (UNVERÄNDERT)
+        curr_close = curr.close
+        dist_fast = abs(curr_close - ema_fast)
+        dist_slow = abs(curr_close - ema_slow)
+        ema_ref = ema_fast if dist_fast > dist_slow else ema_slow
+
+        stop_loss = ema_ref - 2 * self.spread
+        min_broker_dist = min_dist
+
+        if entry_price < current_ask + min_broker_dist:
+            entry_price = current_ask + min_broker_dist + tick_size
+        if abs(entry_price - stop_loss) < min_broker_dist:
+            stop_loss = entry_price - min_broker_dist
+
+        entry_price = round(entry_price / tick_size) * tick_size
+        stop_loss   = round(stop_loss   / tick_size) * tick_size
+
+        if stop_loss >= entry_price:
+            print(f"[ERROR] SL >= Entry nach Adjustierung! SL={stop_loss}, Entry={entry_price}")
+            return None
+
+        print(
+            f"[DEBUG] check_buy_stop: prev.high={prev.high}, spread={self.spread}, "
+            f"stop_loss={stop_loss}, entry_price={entry_price}, ask={current_ask}, "
+            f"min_broker_dist={min_broker_dist}, use_anchor={use_anchor}"
+        )
+
+        return {"side": "buy", "entry_price": entry_price, "stop_loss": stop_loss}
+
+
+
+
+
+
+
+
+
+    def check_sell_stop(
+        self,
+        candles,
+        current_bid,
+        stop_level,
+        tick_size,
+        phase: Optional[Phase] = None,
+        ctx: Optional[PhaseState] = None,
+        **kwargs
+    ):
+        if not self._is_within_allowed_time():
+            print("[INFO] Sell-Stop übersprungen – außerhalb des Zeitfensters.")
+            return None
+
+        if phase != Phase.BASE_SWITCH_BEAR:
+            print(f"[SKIP] Sell-Stop: Phase ist {phase}, erwartet BASE_SWITCH_BEAR")
+            return None
+
+        if ctx is None:
+            print("[SKIP] Sell-Stop: ctx fehlt")
+            return None
+
+        candles = ensure_list_of_candles(candles)
+        if len(candles) < 2:
+            return None
+
+        # --- NEU: Anchor einlesen ---
+        anchor = kwargs.get("anchor") or {}
+        use_anchor = (
+            isinstance(anchor, dict)
+            and anchor.get("dir") == "bear"
+            and (anchor.get("previous_extreme") is not None)
+            and (anchor.get("phase") in (Phase.BASE_SWITCH_BEAR, Phase.SWITCH_BEAR, None))
+        )
+
+        # 1) Confirmation
+        cctx = ctx.last_confirmation_bearish
+        confirm = cctx.candle if (cctx and cctx.valid) else None
+        if not confirm:
+            print(f"[SKIP] Sell-Stop: Keine gültige Confirmation-Bearish vorhanden (valid={getattr(cctx,'valid',None)})")
+            return None
+
+        # 2) Cluster-Fenster
+        cluster_ts = ctx.bear_cluster_enter_ts or ctx.phase_enter_ts
+        if cluster_ts and getattr(confirm, "timestamp", None) and confirm.timestamp < cluster_ts:
+            print(f"[SKIP] Sell-Stop: Confirmation vor Cluster-Eintritt (conf_ts={confirm.timestamp}, cluster_ts={cluster_ts})")
+            return None
+
+        # 3) Confirm nicht zwingend im Buffer, wenn Anchor genutzt wird
+        if not use_anchor:
+            conf_idx = next((i for i, c in enumerate(candles)
+                         if hasattr(confirm, 'timestamp') and c.timestamp == confirm.timestamp), None)
+            if conf_idx is None:
+                print(f"[SKIP] Sell-Stop: Confirm-Candle nicht im aktuellen Buffer (TS={getattr(confirm,'timestamp',None)})")
+                return None
+            if cluster_ts:
+                start_idx = next((i for i, c in enumerate(candles)
+                              if getattr(c, 'timestamp', None) and c.timestamp >= cluster_ts), 0)
+                if conf_idx < start_idx:
+                    print(f"[SKIP] Sell-Stop: Confirm-Candle liegt vor Fenster (conf_idx={conf_idx}, start_idx={start_idx})")
+                    return None
+
+        # 4) Switch-Kontext nur verlangen ohne Anchor
+        if not use_anchor:
+            prev_lower = ctx.switch_bear_prev_lower_low
+            initial_high = ctx.switch_bear_initial_high
+            if prev_lower is None or initial_high is None:
+                print(f"[SKIP] Sell-Stop: switch_bear_prev_lower_low={prev_lower}, switch_bear_initial_high={initial_high}")
+                return None
+
+        # === Preis-/SL-Logik ===
+        prev = candles[-2]
+        min_dist = max(self._min_dist(stop_level, tick_size), tick_size)
+
+        # --- NEU: Trigger aus Anchor; sonst alte Logik ---
+        if use_anchor:
+            trigger = float(anchor["previous_extreme"])
+            desired_entry = trigger - tick_size  # 1 Tick unter dem Anker-Low
+            print(f"[ANCHOR] Sell-Stop: using frozen trigger @ {trigger} -> desired_entry={desired_entry}")
+        else:
+            desired_entry = prev.low - self.spread
+
+        if current_bid - desired_entry < min_dist:
+            entry_price = current_bid - min_dist - tick_size
+        else:
+            entry_price = desired_entry
+
+        curr = candles[-1]
+        ema_fast = getattr(curr, "ema10", None)
+        ema_slow = getattr(curr, "ema20", None)
+        if ema_fast is None or ema_slow is None:
+            print("[SKIP] Sell-Stop: EMA10 oder EMA20 fehlt")
+            return None
+
+        # SL weiterhin EMA-basiert (UNVERÄNDERT)
+        curr_close = curr.close
+        dist_fast = abs(curr_close - ema_fast)
+        dist_slow = abs(curr_close - ema_slow)
+        ema_ref = ema_fast if dist_fast > dist_slow else ema_slow
+
+        stop_loss = ema_ref + 2 * self.spread
+        min_broker_dist = min_dist
+
+        if current_bid - entry_price < min_broker_dist:
+            entry_price = current_bid - min_broker_dist - tick_size
+        if abs(stop_loss - entry_price) < min_broker_dist:
+            stop_loss = entry_price + min_broker_dist
+
+        entry_price = round(entry_price / tick_size) * tick_size
+        stop_loss   = round(stop_loss   / tick_size) * tick_size
+
+        if stop_loss <= entry_price:
+            print(f"[ERROR] SL <= Entry nach Adjustierung! SL={stop_loss}, Entry={entry_price}")
+            return None
+
+        print(
+            f"[DEBUG] check_sell_stop: prev.low={prev.low}, spread={self.spread}, "
+            f"stop_loss={stop_loss}, entry_price={entry_price}, bid={current_bid}, "
+            f"min_broker_dist={min_broker_dist}, use_anchor={use_anchor}"
+        )
+
+        return {"side": "sell", "entry_price": entry_price, "stop_loss": stop_loss}
+
+
